@@ -1307,3 +1307,554 @@ export default {
   validateProjectAccess,
 };
 
+
+==================================================================================================================================================================================================================
+
+/**
+ * Main entry point for the audit-log package
+ * Exports everything needed for consumers to use the package
+ */
+
+// src/index.ts
+
+// Import core classes and types
+import { Database } from './database/database';
+import { CryptoService } from './services/crypto.service';
+import { EventRepository } from './repository/event.repository';
+import { EventService } from './services/event.service';
+import { AuditLogClient } from './client/audit-log.client';
+
+// Import and re-export all types for consumers
+export * from './types';
+
+// Export the core classes
+export {
+  Database,
+  CryptoService,
+  EventRepository,
+  EventService,
+  AuditLogClient
+};
+
+/**
+ * Factory function to create and initialize the audit log client
+ * @param config Configuration for the audit log
+ * @returns Initialized AuditLogClient
+ */
+export function createAuditLogClient(config: {
+  // Database configuration
+  database: {
+    host: string;
+    port: number;
+    user: string;
+    password: string;
+    database: string;
+    ssl?: boolean;
+    poolSize?: number;
+    idleTimeoutMillis?: number;
+    debug?: boolean;
+  },
+  // Crypto configuration
+  crypto: {
+    algorithm?: string;
+    hashAlgorithm?: string;
+    privateKey: string;
+    publicKey: string;
+  },
+  // Application settings
+  application?: {
+    maxBulkEvents?: number;
+    createEventTimeout?: number;
+  },
+  // Optional additional configuration
+  partitionDays?: number;
+  sealAfterDays?: number;
+  wormEnabled?: boolean;
+  wormStoragePath?: string;
+  validation?: {
+    validateOnQuery?: boolean;
+    scheduledValidationInterval?: number;
+  }
+}): AuditLogClient {
+  // Initialize database connection
+  const database = Database.getInstance(config.database);
+  
+  // Initialize crypto service with default algorithm if not specified
+  const cryptoService = new CryptoService({
+    algorithm: config.crypto.algorithm || 'RSA-SHA256',
+    hashAlgorithm: config.crypto.hashAlgorithm || 'sha256',
+    privateKey: config.crypto.privateKey,
+    publicKey: config.crypto.publicKey
+  });
+  
+  // Initialize event repository
+  const eventRepository = new EventRepository(database.getPool());
+  
+  // Initialize event service with application settings
+  const eventService = new EventService(
+    eventRepository,
+    cryptoService,
+    config.application?.maxBulkEvents || 1000,
+    config.application?.createEventTimeout || 5000
+  );
+  
+  // Return the client
+  return new AuditLogClient(eventService);
+}
+
+/**
+ * Initialize the database schema required for the audit log
+ * @param config Database configuration
+ * @returns Promise that resolves when initialization is complete
+ */
+export async function initializeDatabase(config: {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  ssl?: boolean;
+}): Promise<void> {
+  const database = Database.getInstance(config);
+  
+  // Create required tables if they don't exist
+  await database.query(`
+    -- Create audit_events table if it doesn't exist
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id UUID PRIMARY KEY,
+      action VARCHAR(255) NOT NULL,
+      crud VARCHAR(10) NOT NULL,
+      group_id VARCHAR(255),
+      group_name VARCHAR(255),
+      actor_id VARCHAR(255),
+      actor_name VARCHAR(255),
+      actor_href VARCHAR(1024),
+      target_id VARCHAR(255),
+      target_name VARCHAR(255),
+      target_href VARCHAR(1024),
+      target_type VARCHAR(255),
+      source_ip VARCHAR(50),
+      description TEXT,
+      is_anonymous BOOLEAN DEFAULT FALSE,
+      is_failure BOOLEAN DEFAULT FALSE,
+      component VARCHAR(255),
+      version VARCHAR(50),
+      external_id VARCHAR(255),
+      fields JSONB,
+      metadata JSONB,
+      created_at TIMESTAMP NOT NULL,
+      received_at TIMESTAMP NOT NULL,
+      project_id VARCHAR(255) NOT NULL,
+      environment_id VARCHAR(255) NOT NULL,
+      hash VARCHAR(128) NOT NULL,
+      previous_hash VARCHAR(128),
+      signature TEXT NOT NULL,
+      actor_fields JSONB,
+      target_fields JSONB
+    );
+
+    -- Create indexes for efficient querying if they don't exist
+    CREATE INDEX IF NOT EXISTS idx_audit_events_project_env ON audit_events(project_id, environment_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_events_actor_id ON audit_events(actor_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_events_target_id ON audit_events(target_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action);
+
+    -- Create tables for resilience
+    CREATE TABLE IF NOT EXISTS ingest_task (
+      id UUID PRIMARY KEY,
+      original_event JSONB NOT NULL,
+      project_id VARCHAR(255) NOT NULL,
+      environment_id VARCHAR(255) NOT NULL,
+      new_event_id UUID NOT NULL,
+      received TIMESTAMP NOT NULL,
+      processed BOOLEAN DEFAULT FALSE
+    );
+
+    CREATE TABLE IF NOT EXISTS backlog (
+      id SERIAL PRIMARY KEY,
+      project_id VARCHAR(255) NOT NULL,
+      environment_id VARCHAR(255) NOT NULL,
+      new_event_id UUID NOT NULL,
+      received TIMESTAMP NOT NULL,
+      original_event JSONB NOT NULL,
+      processed BOOLEAN DEFAULT FALSE,
+      attempts INTEGER DEFAULT 0,
+      last_attempt TIMESTAMP
+    );
+  `);
+}
+
+
+/**
+ * Example usage of the audit-log package in another codebase
+ */
+
+// Import the package in your application
+import { createAuditLogClient, initializeDatabase, AuditLogClient, CreateEventRequest } from 'audit-log-package';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
+
+/**
+ * Initialize the audit log client with configuration
+ * You can do this during your application startup
+ */
+async function setupAuditLog(): Promise<AuditLogClient> {
+  try {
+    // Step 1: Initialize database schema if needed
+    // This is typically done once during application deployment
+    // or first run, not on every startup
+    if (process.env.INIT_DB === 'true') {
+      await initializeDatabase({
+        host: process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.DB_PORT || '5432'),
+        user: process.env.DB_USER || 'postgres',
+        password: process.env.DB_PASSWORD || '',
+        database: process.env.DB_NAME || 'audit_logs',
+        ssl: process.env.DB_SSL === 'true'
+      });
+      console.log('Database schema initialized successfully');
+    }
+    
+    // Step 2: Create and configure the audit log client
+    const auditLogClient = createAuditLogClient({
+      // Database configuration
+      database: {
+        host: process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.DB_PORT || '5432'),
+        user: process.env.DB_USER || 'postgres',
+        password: process.env.DB_PASSWORD || '',
+        database: process.env.DB_NAME || 'audit_logs',
+        ssl: process.env.DB_SSL === 'true',
+        // Optional database settings
+        poolSize: parseInt(process.env.DB_POOL_SIZE || '20'),
+        idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT || '30000'),
+        debug: process.env.DB_DEBUG === 'true'
+      },
+      
+      // Cryptographic settings (required)
+      crypto: {
+        privateKey: process.env.CRYPTO_PRIVATE_KEY || '', // Required
+        publicKey: process.env.CRYPTO_PUBLIC_KEY || '',   // Required
+        algorithm: process.env.CRYPTO_ALGORITHM || 'RSA-SHA256',
+        hashAlgorithm: process.env.CRYPTO_HASH_ALGORITHM || 'sha256'
+      },
+      
+      // Application settings
+      application: {
+        maxBulkEvents: parseInt(process.env.MAX_BULK_EVENTS || '1000'),
+        createEventTimeout: parseInt(process.env.CREATE_EVENT_TIMEOUT || '5000')
+      },
+      
+      // Optional additional settings
+      partitionDays: parseInt(process.env.PARTITION_DAYS || '7'),
+      sealAfterDays: parseInt(process.env.SEAL_AFTER_DAYS || '30'),
+      wormEnabled: process.env.WORM_ENABLED === 'true',
+      wormStoragePath: process.env.WORM_STORAGE_PATH || './worm-storage',
+      validation: {
+        validateOnQuery: process.env.VALIDATE_ON_QUERY === 'true',
+        scheduledValidationInterval: parseInt(process.env.VALIDATION_INTERVAL || '86400')
+      }
+    });
+    
+    // Step 3: Set default project and environment
+    auditLogClient.setContext(
+      process.env.PROJECT_ID || 'default-project',
+      process.env.ENVIRONMENT || 'development'
+    );
+    
+    console.log('Audit log client initialized successfully');
+    return auditLogClient;
+    
+  } catch (error) {
+    console.error('Failed to initialize audit log:', error);
+    throw error;
+  }
+}
+
+/**
+ * Example function that uses the audit log client in an Express middleware
+ */
+export function createAuditMiddleware(auditLogClient: AuditLogClient) {
+  return async (req: any, res: any, next: any) => {
+    // Save the original end function
+    const originalEnd = res.end;
+    
+    // Override the end function to log after response is sent
+    res.end = async function(...args: any[]) {
+      // Call the original end function
+      originalEnd.apply(res, args);
+      
+      try {
+        // Create the audit event
+        const event: CreateEventRequest = {
+          action: `api.${req.method.toLowerCase()}`,
+          crud: mapMethodToCrud(req.method),
+          actor: {
+            id: req.user?.id || 'anonymous',
+            name: req.user?.name || 'Anonymous User'
+          },
+          target: {
+            id: req.originalUrl,
+            name: `API Endpoint: ${req.originalUrl}`,
+            type: 'endpoint'
+          },
+          source_ip: req.ip,
+          description: `${req.method} request to ${req.originalUrl}`,
+          is_anonymous: !req.user,
+          is_failure: res.statusCode >= 400,
+          component: 'api',
+          version: process.env.API_VERSION || '1.0',
+          fields: {
+            statusCode: res.statusCode,
+            method: req.method,
+            path: req.path,
+            query: req.query
+          }
+        };
+        
+        await auditLogClient.createEvent(event);
+      } catch (error) {
+        // Don't let audit logging errors affect the API response
+        console.error('Failed to create audit log:', error);
+      }
+    };
+    
+    next();
+  };
+}
+
+/**
+ * Map HTTP method to CRUD operation
+ */
+function mapMethodToCrud(method: string): 'create' | 'read' | 'update' | 'delete' {
+  switch (method.toUpperCase()) {
+    case 'POST':
+      return 'create';
+    case 'GET':
+      return 'read';
+    case 'PUT':
+    case 'PATCH':
+      return 'update';
+    case 'DELETE':
+      return 'delete';
+    default:
+      return 'read';
+  }
+}
+
+/**
+ * Example usage in an Express application
+ */
+async function setupExampleApp() {
+  // Initialize the audit log client
+  const auditLogClient = await setupAuditLog();
+  
+  // Create Express app
+  const express = require('express');
+  const app = express();
+  
+  // Add audit log middleware to all routes
+  app.use(createAuditMiddleware(auditLogClient));
+  
+  // Your route handlers
+  app.get('/users/:id', (req: any, res: any) => {
+    // Your handler logic
+    res.json({ id: req.params.id, name: 'Example User' });
+  });
+  
+  // Example of manually logging an event
+  app.post('/login', async (req: any, res: any) => {
+    // Authentication logic
+    const user = { id: '123', name: 'Example User' };
+    
+    try {
+      // Manually log the login event
+      await auditLogClient.createEvent({
+        action: 'user.login',
+        crud: 'read',
+        actor: {
+          id: user.id,
+          name: user.name
+        },
+        source_ip: req.ip,
+        description: 'User logged in successfully',
+        component: 'authentication'
+      });
+      
+      // Send response
+      res.json({ success: true, user });
+    } catch (error) {
+      console.error('Login or audit log failed:', error);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  });
+  
+  // Start server
+  app.listen(3000, () => {
+    console.log('Server started on port 3000');
+  });
+  
+  // Graceful shutdown
+  process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    
+    // Close database connections
+    await auditLogClient.close();
+    
+    process.exit(0);
+  });
+}
+
+// Run the example
+setupExampleApp().catch(console.error);
+
+{
+  "name": "audit-log-package",
+  "version": "1.0.0",
+  "description": "Secure, tamper-evident audit logging system with blockchain-style verification",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "audit",
+    "logging",
+    "security",
+    "immutable",
+    "tamper-evident"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.1",
+    "@types/node": "^18.16.0",
+    "@types/pg": "^8.6.6",
+    "@typescript-eslint/eslint-plugin": "^5.59.1",
+    "@typescript-eslint/parser": "^5.59.1",
+    "eslint": "^8.39.0",
+    "jest": "^29.5.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.4"
+  },
+  "dependencies": {
+    "crypto": "^1.0.1",
+    "pg": "^8.11.0",
+    "pg-format": "^1.0.4",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ]
+}
+
+
+====================== 
+How to Use the Audit Log Package in Your Project
+The package has been designed to be easily integrated into any TypeScript/JavaScript application. Here's how to use it:
+1. Installation
+First, you would install the package from npm:
+npm install audit-log-package
+
+2. Initialization
+In your application's startup code, you'll need to initialize the audit log client with your configuration:
+import { createAuditLogClient } from 'audit-log-package';
+
+// Create the client with your configuration
+const auditLogClient = createAuditLogClient({
+  // Database connection details
+  database: {
+    host: process.env.AUDIT_DB_HOST || 'localhost',
+    port: parseInt(process.env.AUDIT_DB_PORT || '5432'),
+    user: process.env.AUDIT_DB_USER || 'postgres',
+    password: process.env.AUDIT_DB_PASSWORD || '',
+    database: process.env.AUDIT_DB_NAME || 'audit_logs'
+  },
+  
+  // Cryptographic keys for signing and verifying audit entries
+  crypto: {
+    privateKey: process.env.AUDIT_PRIVATE_KEY || '',
+    publicKey: process.env.AUDIT_PUBLIC_KEY || ''
+  }
+});
+
+// Set the default project and environment context
+auditLogClient.setContext('your-project-id', 'production');
+
+
+3. Creating Audit Events
+You can now create audit events throughout your application:
+typescript// Log a user action
+await auditLogClient.createEvent({
+  action: 'user.create',
+  crud: 'create',
+  actor: {
+    id: 'admin-123',
+    name: 'Administrator'
+  },
+  target: {
+    id: 'user-456',
+    name: 'John Doe',
+    type: 'user'
+  },
+  description: 'Created a new user account'
+});
+4. Bulk Event Creation
+For high-throughput applications, you can create multiple events at once:
+typescriptawait auditLogClient.createEvents({
+  events: [
+    {
+      action: 'document.view',
+      crud: 'read',
+      actor: { id: 'user-123' },
+      target: { id: 'doc-456', type: 'document' }
+    },
+    {
+      action: 'document.download',
+      crud: 'read',
+      actor: { id: 'user-123' },
+      target: { id: 'doc-456', type: 'document' }
+    }
+  ]
+});
+5. Database Setup
+Before using the package for the first time, you'll need to initialize the database schema:
+typescriptimport { initializeDatabase } from 'audit-log-package';
+
+// Run this during application deployment or first run
+await initializeDatabase({
+  host: process.env.AUDIT_DB_HOST || 'localhost',
+  port: parseInt(process.env.AUDIT_DB_PORT || '5432'),
+  user: process.env.AUDIT_DB_USER || 'postgres',
+  password: process.env.AUDIT_DB_PASSWORD || '',
+  database: process.env.AUDIT_DB_NAME || 'audit_logs'
+});
+6. Cleanup
+When your application is shutting down, close the database connections:
+typescript// In your shutdown handler
+process.on('SIGTERM', async () => {
+  await auditLogClient.close();
+  process.exit(0);
+});
+Key Features
+
+Configuration Flexibility: All settings can be passed during initialization
+Project/Environment Context: Set default context once and use throughout your app
+Resilient Event Storage: Failed events are stored in a backlog
+Cryptographic Verification: Events are cryptographically signed and chained
+Database Connection Management: Connection pooling for optimal performance
+
+The main package entry point (index.ts) exports everything you need, and the configuration options provide flexibility for different deployment environments. You can store sensitive information like database credentials and crypto keys in environment variables for security.
+
+
